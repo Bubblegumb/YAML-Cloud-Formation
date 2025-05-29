@@ -1,0 +1,240 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'SIT233 WordPress Networking Infrastructure - VPC, Subnets, Gateways, Security Groups'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'WordPress-SIT233'
+    Description: 'Project name for resource naming'
+  
+  VPCCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: 'CIDR block for VPC'
+
+Resources:
+  # VPC
+  WordPressCloudVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VPCCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  # Attach IGW to VPC
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref WordPressCloudVPC
+
+  # Public Subnet 1
+  PublicCloudSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WordPressCloudVPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: '10.0.1.0/24'
+
+  # Public Subnet 2
+  PublicCloudSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WordPressCloudVPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: '10.0.2.0/24'
+
+  # Private Subnet 1
+  PrivateCloudSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WordPressCloudVPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: '10.0.3.0/24'
+
+
+  # Private Subnet 2
+  PrivateCloudSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WordPressCloudVPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: '10.0.4.0/24'
+
+  # Elastic IP for NAT Gateway
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  # NAT Gateway
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicCloudSubnet1
+
+  # Public Route Table
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref WordPressCloudVPC
+
+  # Public Route to Internet
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  # Associate Public Subnet 1 with Public Route Table
+  PublicCloudSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicCloudSubnet1
+
+  # Associate Public Subnet 2 with Public Route Table
+  PublicCloudSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicCloudSubnet2
+
+  # Private Route Table
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref WordPressCloudVPC
+
+
+  # Private Route to NAT Gateway
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref NatGateway
+
+  # Associate Private Subnet 1 with Private Route Table
+  PrivateCloudSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateCloudSubnet1
+
+  # Associate Private Subnet 2 with Private Route Table
+  PrivateCloudSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateCloudSubnet2
+
+  # Security Group for Load Balancer
+  ELBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-ELB-Security-Group'
+      GroupDescription: 'Security group for Application Load Balancer'
+      VpcId: !Ref WordPressCloudVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: '0.0.0.0/0'
+          Description: 'HTTP from internet'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+          Description: 'HTTPS from internet'
+
+  # Security Group for Web Servers
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-WebServer-Security-Group'
+      GroupDescription: 'Security group for WordPress web servers'
+      VpcId: !Ref WordPressCloudVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ELBSecurityGroup
+          Description: 'HTTP from Load Balancer only'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-WebServer-SG'
+
+  # Security Group for RDS
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-RDS-Security-Group'
+      GroupDescription: 'Security group for MySQL RDS'
+      VpcId: !Ref WordPressCloudVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WebServerSecurityGroup
+          Description: 'MySQL access from web servers only'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-RDS-SG'
+
+Outputs:
+  VPCId:
+    Description: 'VPC ID'
+    Value: !Ref WordPressCloudVPC
+    Export:
+      Name: !Sub '${ProjectName}-VPC-ID'
+
+  PublicCloudSubnet1Id:
+    Description: 'Public Subnet 1 ID'
+    Value: !Ref PublicCloudSubnet1
+    Export:
+      Name: !Sub '${ProjectName}-Public-Subnet-1-ID'
+
+  PublicCloudSubnet2Id:
+    Description: 'Public Subnet 2 ID'
+    Value: !Ref PublicCloudSubnet2
+    Export:
+      Name: !Sub '${ProjectName}-Public-Subnet-2-ID'
+
+  PrivateCloudSubnet1Id:
+    Description: 'Private Subnet 1 ID'
+    Value: !Ref PrivateCloudSubnet1
+    Export:
+      Name: !Sub '${ProjectName}-Private-Subnet-1-ID'
+
+  PrivateCloudSubnet2Id:
+    Description: 'Private Subnet 2 ID'
+    Value: !Ref PrivateCloudSubnet2
+    Export:
+      Name: !Sub '${ProjectName}-Private-Subnet-2-ID'
+
+  ELBSecurityGroupId:
+    Description: 'ELB Security Group ID'
+    Value: !Ref ELBSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-ELB-SG-ID'
+
+  WebServerSecurityGroupId:
+    Description: 'Web Server Security Group ID'
+    Value: !Ref WebServerSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-WebServer-SG-ID'
+
+  RDSSecurityGroupId:
+    Description: 'RDS Security Group ID'
+    Value: !Ref RDSSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-RDS-SG-ID'

@@ -1,0 +1,232 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'SIT233 WordPress Application Infrastructure - RDS, S3, ALB, ASG, IAM'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'WordPress-SIT233'
+    Description: 'Project name for resource naming (must match networking stack)'
+  
+  DBUsername:
+    Type: String
+    Default: 'admin'
+    Description: 'Database administrator username'
+    ConstraintDescription: 'Must be a valid database username'
+  
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    Description: 'Database administrator password (8-41 characters)'
+    ConstraintDescription: 'Must be between 8 and 41 characters'
+  
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: 'EC2 Key Pair for SSH access'
+  
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+    Description: 'Latest Amazon Linux 2 AMI ID'
+
+Resources:
+  # S3 Bucket for WordPress Media
+  S3MediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'word-press-media-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Suspended
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-Media-Bucket'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # DB Subnet Group
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${ProjectName}-db-subnet-group'
+      DBSubnetGroupDescription: 'Subnet group for WordPress RDS'
+      SubnetIds:
+        - Fn::ImportValue: !Sub '${ProjectName}-Private-Subnet-1-ID'
+        - Fn::ImportValue: !Sub '${ProjectName}-Private-Subnet-2-ID'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DB-SubnetGroup'
+
+  # RDS MySQL Database
+  WordPressDatabase:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-database'
+      DBName: 'wordpress'
+      DBInstanceClass: 'db.t3.micro'
+      Engine: 'mysql'
+      EngineVersion: '8.0.35'
+      AllocatedStorage: 20
+      StorageType: 'gp2'
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      VPCSecurityGroups:
+        - Fn::ImportValue: !Sub '${ProjectName}-RDS-SG-ID'
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      BackupRetentionPeriod: 0
+      MultiAZ: false  # We'll enable this after creation via console
+      PubliclyAccessible: false
+      StorageEncrypted: false  # Disabled for t3.micro in free tier
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-Database'
+
+  # Target Group for ALB
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-Target-Group'
+      Port: 80
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub '${ProjectName}-VPC-ID'
+      HealthCheckPath: '/'
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetType: instance
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-Target-Group'
+
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-ALB'
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets:
+        - Fn::ImportValue: !Sub '${ProjectName}-Public-Subnet-1-ID'
+        - Fn::ImportValue: !Sub '${ProjectName}-Public-Subnet-2-ID'
+      SecurityGroups:
+        - Fn::ImportValue: !Sub '${ProjectName}-ELB-SG-ID'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ALB'
+
+  # ALB Listener
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # Launch Template
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ProjectName}-Launch-Template'
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: t2.micro
+        KeyName: !Ref KeyPairName
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub '${ProjectName}-WebServer-SG-ID'
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum -y update
+            yum -y install php httpd mysql
+            systemctl enable httpd.service
+            systemctl start httpd.service
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${ProjectName}-WebServer'
+              - Key: Project
+                Value: !Ref ProjectName
+
+  # Auto Scaling Group
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${ProjectName}-ASG'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 3
+      DesiredCapacity: 1
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub '${ProjectName}-Private-Subnet-1-ID'
+        - Fn::ImportValue: !Sub '${ProjectName}-Private-Subnet-2-ID'
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ASG-Instance'
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: !Ref ProjectName
+          PropagateAtLaunch: true
+
+  # Auto Scaling Policy - Scale Out
+  ScaleOutPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 70
+
+Outputs:
+  S3BucketName:
+    Description: 'S3 Bucket for WordPress Media'
+    Value: !Ref S3MediaBucket
+    Export:
+      Name: !Sub '${ProjectName}-S3-Bucket-Name'
+
+  DatabaseEndpoint:
+    Description: 'RDS Database Endpoint'
+    Value: !GetAtt WordPressDatabase.Endpoint.Address
+    Export:
+      Name: !Sub '${ProjectName}-DB-Endpoint'
+
+  LoadBalancerDNS:
+    Description: 'Application Load Balancer DNS Name'
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${ProjectName}-ALB-DNS'
+
+  LoadBalancerURL:
+    Description: 'WordPress Website URL'
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+
+  AutoScalingGroupName:
+    Description: 'Auto Scaling Group Name'
+    Value: !Ref AutoScalingGroup
+    Export:
+      Name: !Sub '${ProjectName}-ASG-Name'
